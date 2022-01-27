@@ -1,4 +1,6 @@
-
+// Copyright Take Vos 2022.
+// Distributed under the Boost Software License, Version 1.0.
+// (See accompanying file LICENSE_1_0.txt or copy at https://www.boost.org/LICENSE_1_0.txt)
 
 #pragma once
 
@@ -8,13 +10,12 @@
 #include <cstdint>
 #include <cstddef>
 
-namespace tt::inline v1 {
+namespace tt::inline v1{
 
-namespace detail {
+    namespace detail {
 
 template<typename K, typename V>
-struct wfree_hash_map_item
-{
+struct wfree_hash_map_item {
     using key_type = K;
     using value_type = V;
 
@@ -28,7 +29,8 @@ struct wfree_hash_map_item
 
     template<is_forward_for<key_type> Key, is_forward_for<value_type> Value>
     constexpr wfree_hash_map_item(Key &&key, Value &&value) noexcept :
-        key(std::forward<Key>(key)), value(std::forward<Value>(value)) {}
+        key(std::forward<Key>(key)), value(std::forward<Value>(value))
+    {}
 };
 
 template<typename K, typename V>
@@ -41,9 +43,8 @@ struct wfree_hash_map_slot {
      *
      * Values:
      *  - 0: Empty
-     *  - 1: Fail
-     *  - 2: Reserves
-     *  - 3: Tomb stone
+     *  - 1: Reserved
+     *  - 2: Tomb stone
      *  - other: Key/Value are valid.
      *
      * Get operation:
@@ -67,11 +68,11 @@ struct wfree_hash_map_slot {
      * Remove operation:
      *  - Find all slots with the same key (forward).
      *  - Entomb any found slot in order.
-     * 
+     *
      *
      */
     std::atomic<size_t> _hash;
-    alignas(item_type) std::array<char,sizeof(item_type)> _buffer;
+    alignas(item_type) std::array<char, sizeof(item_type)> _buffer;
 
     ~wfree_hash_map_slot() noexcept
     {
@@ -133,13 +134,14 @@ struct wfree_hash_map_slot {
     }
 
     /** Entomb a slot.
-     * 
+     *
      * @pre `emplace()` or `reserve()` must be called first.
+     * @return True if this call entombed the slot, so that decrement is allowed.
      */
-    void entomb() noexcept
+    [[nodiscard]] bool entomb() noexcept
     {
         tt_axiom(_hash.load(std::memory_order::relaxed) != 0);
-        _hash.store(2, std::memory_order::relaxed);
+        return _hash.except(2, std::memory_order::relaxed) != 2;
     }
 
     /** Destroy the item.
@@ -166,7 +168,7 @@ struct wfree_hash_map_slot {
      * @param value The value to store.
      * @param hash The hash value of the key must be larger than 2.
      */
-    template<is_forward_for<key_type> Key, is_forward_for<value_type> Value>
+    template<forward_for<key_type> Key, forward_for<value_type> Value>
     void emplace(Key &&key, Value &&value, size_t hash) noexcept
     {
         tt_axiom(hash > 2);
@@ -177,48 +179,307 @@ struct wfree_hash_map_slot {
     }
 };
 
-template<typename Key, typename T>
-struct wfree_hash_map_table {
-    using item_type = wfree_hash_map_item<Key, T>;
-    constexpr size_t header_size = sizeof(uint64_t);
-    constexpr size_t data_offset = tt::ceil(header_size, sizeof(item_type));
-
+struct wfree_hash_map_header {
     size_t const capacity;
-    size_t size;
-    size_t remove_index;
 
-    wfree_hash_map_table(wfree_hash_map_table const &) = delete;
-    wfree_hash_map_table(wfree_hash_map_table &&) = delete;
-    wfree_hash_map_table &operator=(wfree_hash_map_table const &) = delete;
-    wfree_hash_map_table &operator=(wfree_hash_map_table &&) = delete;
+    std::atomic<size_t> num_reservations;
+    std::atomic<size_t> num_tombstones;
+    std::atomic<size_t> clean_index;
+    std::atomic<size_t> use_count;
+
+    wfree_hash_map_header(wfree_hash_map_header const &) = delete;
+    wfree_hash_map_header(wfree_hash_map_header &&) = delete;
+    wfree_hash_map_header &operator=(wfree_hash_map_header const &) = delete;
+    wfree_hash_map_header &operator=(wfree_hash_map_header &&) = delete;
+    wfree_hash_map_header(size_t capacity) noexcept :
+        capacity(capacity), num_reservations(0), num_tombstones(0), clean_index(capacity + 1), use_count(0)
+    {}
+
+    void increment_reservations() noexcept
+    {
+        num_reservations.fetch_add(1, std::memory_order::acquire);
+    }
+
+    void increment_tombstones() noexcept
+    {
+        num_tombstones.fetch_add(1, std::memory_order::release);
+    }
+
+    /** Increment the use count on the secondary table.
+     */
+    void increment_use_count() noexcept
+    {
+        use_count.fetch_add(1, std::memory_order::acquire);
+    }
+
+    /** Decrement the use count on the secondary table.
+     */
+    void decrement_use_count() noexcept
+    {
+        use_count.fetch_sub(1, std::memory_order::release);
+    }
+};
+
+template<typename T>
+class wfree_hash_map_pointer {
+public:
+    using value_type = T;
+
+    ~wfree_hash_map_pointer()
+    {
+        if (_table) {
+            _table->decrement_use_count();
+        }
+    }
+
+    wfree_hash_map_pointer(wfree_hash_map_pointer const &other) noexcept : _table(other._table), _ptr(other._ptr)
+    {
+        if (_table) {
+            _table->increment_use_count();
+        }
+    }
+
+    wfree_hash_map_pointer &operator=(wfree_hash_map_pointer const &other) noexcept
+    {
+        if (_table != _other._table) {
+            if (_table) {
+                _table->decrement_use_count();
+            }
+            _secondary = other._secondary;
+            if (_table) {
+                _table->increment_use_count();
+            }
+        }
+        _ptr = other._ptr;
+    }
+
+    wfree_hash_map_pointer(wfree_hash_map_pointer &&other) noexcept :
+        _table(std::exchange(other._table, nullptr)), _ptr(std::exchange(other._ptr, nullptr))
+    {}
+
+    wfree_hash_map_pointer &operator=(wfree_hash_map_pointer &&other) noexcept
+    {
+        if (_table) {
+            _table->decrement_use_count();
+        }
+        _table = std::exchange(other._table, nullptr);
+        _ptr = std::exchange(other._ptr, nullptr);
+    }
+
+    [[nodiscard]] static wfree_hash_map_pointer make_pointer(wfree_hash_map_header *table, T *ptr)
+    {
+        return wfree_hash_map_pointer{table, ptr};
+    }
+
+    value_type *operator->() noexcept
+    {
+        return _ptr;
+    }
+
+    value_type &operator*() noexcept
+    {
+        return *_ptr;
+    }
+
+private:
+    wfree_hash_map_header *_table;
+    value_type *_ptr;
+
+    /** Construct a pointer.
+     *
+     * @pre secondary->increment_ref_count() must be called first.
+     * @param secondary Pointer to the secondary table or nullptr
+     * @param ptr The pointer to the value.
+     */
+    wfree_hash_map_pointer(wfree_hash_map_header *table, T *ptr) noexcept :
+        _table(table), _ptr(ptr)
+    {}
+};
+
+template<typename K, typename V, typename KeyEqual>
+struct wfree_hash_map_table : wfree_hash_map_header {
+    using key_type = K;
+    using value_type = V;
+    using slot_type = wfree_hash_map_slot<key_type, value_type>;
+    using key_equal = KeyEqual;
+    constexpr size_t data_offset = tt::ceil(sizeof(wfree_hash_map_header), sizeof(slot_type));
 
     ~wfree_hash_map_table() noexcept
     {
         std::destroy(begin(), end());
     }
 
-    wfree_hash_map_table(size_t capacity) noexcept :
-        capacity(capacity), size(0), remove_index(capacity + 1)
+    wfree_hash_map_table(size_t capacity) noexcept : wfree_hash_map_header(capacity)
     {
         for (auto it = begin(); it != end(); ++it) {
             std::construct_at(it);
         }
     }
 
-    wfree_hash_map_slot *begin() noexcept
+    slot_type *begin() noexcept
     {
         auto *data = reinterpret_cast<char *>(this) + data_offset;
-        return reinterpret_cast<wfree_hash_map_item*>(data);
+        return reinterpret_cast<wfree_hash_map_item *>(data);
     }
 
-    wfree_hash_map_slot *end() noexcept
+    slot_type *end() noexcept
     {
         return begin() + capacity;
     }
 
-    wfree_hash_map_slot &operator[](size_t index) noexcept
+    slot_type *first_slot(size_t hash) noexcept
     {
-        return *(begin() + index);
+        ttlet index = (hash >> 2) % capacity;
+        return begin() + index;
+    }
+
+    slot_type *increment_slot(slot_type *it) noexcept
+    {
+        ++it;
+        return it == end() ? begin() : it;
+    }
+
+    [[nodiscard]] slot_type *reserve_slot(slot_type *it) noexcept
+    {
+        tt_axiom(it != nullptr);
+
+        while (true) {
+            if (it.reserve()) {
+                return it;
+            }
+            it = incement_slot(it);
+        }
+    }
+
+    /** Find a key in the table.
+     *
+     * @note Duplicate keys are removed from the table.
+     * @param key The key to search for.
+     * @param hash The hash of the key.
+     * @return The slot found, end() when reserved slot found, or nullptr when not found. pointer to entry after block.
+     */
+    template<bool StopAtReserved=false>
+    std::pair<slot_type *, slot_type *> find(key_type const &key, size_t hash) noexcept
+    {
+        slot_type *it = first_slot(hash);
+        slot_type *found = nullptr;
+        while (true) {
+            ttlet h = it->hash();
+            if (h == 0 or (StopAtReserved and h == 1)) {
+                return {found, it};
+
+            } else if (h == hash and key_equal{}(it->key(), key)) {
+                // Remove duplicate keys.
+                if (found and found->entomb()) {
+                    increment_tombstones();
+                }
+                found = it;
+            }
+            it = increment_slot(it);
+        }
+        tt_not_reached();
+    }
+
+    /** Search for the key in the table.
+     *
+     * @note Duplicate keys are removed from the table.
+     * @param key The key to search for.
+     * @param hash The hash of the key.
+     * @return The slot that matches the key, or nullptr
+     */
+    slot_type *get(key_type const &key, size_t hash) noexcept
+    {
+        ttlet[found, it] = find(key, hash);
+        return found;
+    }
+
+    /** Set a new key value in the table, overwriting existing.
+     *
+     * @note Duplicate keys are removed from the table.
+     * @param key The key to add to the table.
+     * @param value The value to add to the table.
+     * @param hash The hash of the key.
+     * @return The previous matching slot.
+     */
+    template<forward_for<key_type> Key, forward_for<value_type> Value>
+    slot_type *set(Key &&key, Value &&value, size_t hash) noexcept
+    {
+        auto [found, it] = find(key, hash);
+        auto it = reserve_slot(first);
+        increment_reservations();
+        it->emplace(std::forward<Key>(key), std::forward<Value>(value), hash);
+
+        if (found and found->entomb()) {
+            increment_tombstones();
+        }
+        return nullptr;
+    }
+
+    /** Set a new key value in the table, unless the key is already in the table.
+     *
+     * @note Duplicate keys are removed from the table.
+     * @param key The key to add to the table.
+     * @param value The value to add to the table.
+     * @param hash The hash of the key.
+     * @return The previous matching slot.
+     */
+    template<forward_for<key_type> Key, forward_for<value_type> Value>
+    slot_type *try_set(Key &&key, Value &&value, size_t hash) noexcept
+    {
+        auto [found, it] = find(key, hash);
+        if (found) {
+            return found;
+        }
+
+        it = reserve_slot<StopAtReserved>(it);
+        increment_reservations();
+        it->emplace(std::forward<Key>(key), std::forward<Value>(value), hash);
+        return nullptr;
+    }
+
+    /** Remove a key from the table.
+     * 
+     * @note Duplicate keys are removed from the table.
+     * @param key The key to remove from the table.
+     * @param hash The hash of the key.
+     * @return The previous matching slot.
+     */
+    slot_type *remove(key_type const &key, size_t hash) noexcept
+    {
+        ttlet[found, it] = find(key, hash);
+        if (found and found->entomb()) {
+            increment_tombstones();
+        }
+        return found;
+    }
+
+    /** Move and entry from another hash map table.
+    * 
+    * @post The key/value may be added to this table and is removed from the other table.
+    * @param other_table A pointer to the other table.
+    * @param other_slot A slot from the other table to move.
+    * @param hash The hash value of the key in the other_slot.
+    * @return move failed due to other thread.
+    */
+    other_table *move_from(wfree_hash_map_table *other_table, slot_type *other_slot, size_t hash) noexcept
+    {
+        tt_axiom(other_table != nullptr);
+        tt_axiom(other_slot != nullptr);
+
+        auto [found, it] = find<true>(key, hash);
+
+        // If it can be reserved then there was no reservation in the block that was searched.
+        if (not found and it->reserve()) {
+            increment_reservations();
+            it->emplace(std::forward<Key>(key), std::forward<Value>(value), hash);
+            found = it;
+        }
+
+        if (found and other_slot->entomb()) {
+            other_table->increment_tombstones();
+        }
+
+        return found;
     }
 
     /** Get the amount of bytes needed to allocate the table for a capacity.
@@ -263,108 +524,11 @@ struct wfree_hash_map_table {
         std::allocator_traits<Allocator>::deallocate(allocator, reinterpret_cast<char *>(table_ptr), capacity_to_num_bytes(capacity));
     }
 };
-static_assert(header_size == sizeof(wfree_hash_map_table));
+static_assert(sizeof(wfree_hash_map_header) == sizeof(wfree_hash_map_table));
 
 
-class wfree_hash_map_base {
-public:
-
-    /** Increment the use count on the secondary table.
-     */
-    void increment_use_count() noexcept
-    {
-        use_count.fetch_add(1, std::memory_order::acquire);
-    }
-
-    /** Decrement the use count on the secondary table.
-     */
-    void decrement_use_count() noexcept
-    {
-        use_count.fetch_sub(1, std::memory_order::release);
-    }
-
-private:
-    std::atomic<size_t> use_count;
-}
 
 
-template<typename T>
-class wfree_hash_map_pointer {
-public:
-    using value_type = T;
-    using pointer = value_type *;
-    using reference = value_type &;
-
-    ~wfree_hash_map_pointer()
-    {
-        if (_secondary) {
-            _secondary->decrement_ref_count();
-        }
-    }
-
-    wfree_hash_map_pointer(wfree_hash_map_pointer const &other) noexcept : _secondary(other._secondary), _ptr(other._ptr)
-    {
-        if (_secondary) {
-            _secondary->increment_ref_count();
-        }
-    }
-
-    wfree_hash_map_pointer &operator=(wfree_hash_map_pointer const &other) noexcept
-    {
-        if (_secondary != _other._secondary) {
-            if (_secondary) {
-                _secondary->decrement_ref_count();
-            }
-            _secondary = other._secondary;
-            if (_secondary) {
-                _secondary->increment_ref_count();
-            }
-        }
-        _ptr = other._ptr;
-    }
-
-    wfree_hash_map_pointer(wfree_hash_map_pointer &&other) noexcept :
-        _secondary(std::exchange(other._secondary, nullptr)), _ptr(std::exchange(other._ptr, nullptr)) {}
-
-    wfree_hash_map_pointer &operator=(wfree_hash_map_pointer &&other) noexcept
-    {
-        if (_secondary) {
-            _secondary->decrement_ref_count();
-        }
-        _secondary = std::exchange(other._secondary, nullptr);
-        _ptr = std::exchange(other._ptr, nullptr);
-    }
-
-    [[nodiscard]] static wfree_hash_map_pointer make_pointer(wfree_hash_map_base *map, T *ptr)
-    {
-        return wfree_hash_map_pointer{map, ptr};
-    }
-
-    T *operator->() noexcept
-    {
-        return _ptr;
-    }
-
-    T &operator*() noexcept
-    {
-        return *_otr;
-    }
-
-private:
-    wfree_hash_map_base *_secondary;
-    T *_ptr;
-
-    /** Construct a pointer.
-     *
-     * @pre secondary->increment_ref_count() must be called first.
-     * @param secondary Pointer to the secondary table or nullptr
-     * @param ptr The pointer to the value.
-     */
-    wfree_hash_map_pointer(wfree_hash_map_base *secondary, T *ptr) noexcept :
-        _secondary(secondary), _ptr(ptr)
-    {
-    }
-};
 
 }
 
@@ -394,126 +558,140 @@ template<
     typename Hash = std::hash<Key>,
     typename KeyEqual = std::equal_to<Key>,
     typename Allocator = std::allocator<wfree_hash_map_item<Key, T>>
-class wfree_hash_map : wfree_hash_map_base {
-public:
-    using key_type = Key;
-    using value_type = T;
-    using table_type = wfree_hash_map_table<Key, T, Hash, KeyEqual>;
-    using size_type = std::size_t;
-    using difference_type = std::ptrdiff_t;
-    using hasher = Hash;
-    using key_equal = KeyEqual;
-    using allocator_type = Allocator;
-    using reference = value_type &;
-    using const_reference = value_type const &;
-    using pointer = value_type *;
-    using const_pointer = value_type const *;
+    class wfree_hash_map : wfree_hash_map_base {
+    public:
+        using key_type = Key;
+        using value_type = T;
+        using table_type = wfree_hash_map_table<Key, T, Hash, KeyEqual>;
+        using size_type = std::size_t;
+        using difference_type = std::ptrdiff_t;
+        using hasher = Hash;
+        using key_equal = KeyEqual;
+        using allocator_type = Allocator;
+        using const_pointer = wfree_hash_map_pointer<value_type>;
 
-    /** Remove a key from the hash map.
-     *
-     * This operation will fetch the value associated with the key and
-     * remove the value from the table.
-     *
-     * @note remove has O(1) complexity
-     * @note remove is wait-free.
-     * @param key The key to remove from the hash map.
-     * @param hash The hash value calculated from the key.
-     * @return The previous value.
-     */
-    const_pointer fetch_and_remove(key_type const &key, size_t hash) noexcept
-    {
-        auto [primary, secondary] = get_tables_grow_and_cleanup();
+        /** Get and entry from the hash map.
+        * 
+        * @param key The key to search.
+        * @param hash The hash calculated from the key.
+        * @return A pointer to the entry, or empty.
+        */
+        [[nodiscard]] const_pointer get(key_type const &key, size_t hash) const noexcept
+        {
+            ttlet [primary, secondary] = get_tables();
 
-        // Entomb in order of secondary to primary.
-        value_type const *old_value = nullptr;
-        if (secondary) {
-            old_value = secondary->entomb<true>(hash, key);
+            // Search the primary table for matching entries.
+            primary->increment_use_count();
+            if (ttlet found = primary->get(key, hash)) {
+                return {primary, found};
+            }
+
+            // Search the secondary table for matching entries
+            // Move the entry to the primary table and return the new primary entry.
+            if (secondary) {
+                secondary->increment_use_count();
+                if (ttlet found = secondary->get(key, hash)) {
+                    ttlet new_ptr = primary->move_from(secondary, found, hash);
+                    secondary->decrement_use_count();
+                    return {primary, new_ptr};
+                }
+                secondary->decrement_use_count();   
+            }
+
+            primary->decrement_use_count();
+            return {};
         }
 
-        auto old_primary_value = primary->entomb<false>(hash, key);
-        if (old_primary_value) {
-            old_value = old_primary_value;
+        template<forward_for<key_type> Key, forward_for<value_type> Value>
+        const_pointer set(Key &&key, Value &&value, size_t hash) noexcept
+        {
+            ttlet [primary, secondary] = get_tables_grow_and_cleanup();
+
+            primary->increment_use_count();
+            if (ttlet found = primary->set(std::forward<Key>(key), std::forward<Value>(value), hash)) {
+                return {primary, found};
+            }
+
+            primary->decrement_use_count();
+            return {};
         }
 
-        return old_value;
-    }
+        template<forward_for<key_type> Key, forward_for<value_type> Value>
+        const_pointer try_set(Key &&key, Value &&value, size_t hash) noexcept
+        {
+            ttlet [primary, secondary] = get_tables_grow_and_cleanup();
 
-    /** Remove a key from the hash map.
-     *
-     * This operation will fetch the value associated with the key and
-     * remove the value from the table.
-     *
-     * @note remove has O(1) complexity
-     * @note remove is wait-free.
-     * @param key The key to remove from the hash map.
-     * @return The previous value.
-     */
-    const_pointer fetch_and_remove(key_type const &key) noexcept
-    {
-        return fetch_and_remove(key, hasher{}(key));
-    }
+            primary->increment_use_count();
+            if (ttlet found = primary->try_set(std::forward<Key>(key), std::forward<Value>(value), hash)) {
+                return {primary, found};
+            }
 
-    [[nodiscard]] const_pointer get(size_t hash, key_type const &key) const noexcept
-    {
-        auto [primary, secondary] = get_tables();
-
-        auto old_value = primary->get<false>(hash, key);
-
-        // If the value was not available in the primary, try the secondary.
-        if (not old_value and secondary) {
-            old_value = secondary->get<true>(hash, key);
-            primary->maybe_set<false>(hash, key, *old_value);
-
-            // We use false on this secondary because we are not going to read the value..
-            secondary->entomb<false>(old_value);
+            primary->decrement_use_count();
+            return {};
         }
-        return old_value;
-    }
 
-    const_pointer set(size_t hash, key_type const &key, value_type const &value) noexcept
-    {
-        auto [primary, secondary] = get_tables_grow_and_cleanup();
+        [[nodiscard]] const_pointer remove(key_type const &key, size_t hash) const noexcept
+        {
+            ttlet [primary, secondary] = get_tables_grow_and_cleanup();
 
-        auto old_value = primary->set<false>(hash, key, value);
+            if (secondary) {
+                secondary->increment_use_count();
+                ttlet secondary_found = secondary->remove(key, hash);
 
-        if (secondary) {
-            auto old_secondary_value = secondary->entomb<true>(hash, key);
-            if (not old_value) {
-                old_value = secondary_value;
+                primary->increment_use_count();
+                if (ttlet primary_found = primary->remove(key, hash)) {
+                    secondary->decrement_use_count();
+                    return {primary, primary_found};
+
+                } else if (secondary_found) {
+                    primary->decrement_use_count();
+                    return {secondary, secondary_found};
+
+                } else {
+                    primary->decrement_use_count();
+                    secondary->decrement_use_count();
+                    return {};
+                }
+
+            } else {
+                primary->increment_use_count();
+                if (ttlet primary_found = primary->remove(key, hash)) {
+                    return {primary, primary_found};
+                }
+
+                primary->decrement_use_count();
+                return {};
             }
         }
 
-        return old_value;
-    }
-
-    const_pointer set(key_type const &key, value_type const &value) noexcept
-    {
-        return set(make_hash(key), key, value);
-    }
-
-private:
-    std::atomic<table_type *> _primary;
-    std::atomic<table_type *> _secondary;
-
-    allocator_type _allocator;
-
-    std::pair<table_type *, table_type *> get_tables() const noexcept
-    {
-        // During allocation on the other thread, the secondary will first
-        // get a copy before the primary get set to nullptr. By loading
-        // in this order we get the values in a consistant order.
-        auto *primary = _primary.load(std::memory_order::acquire);
-        auto *secondary = _secondary.load(std::memory_order::acquire);
-
-        if ((primary == nullptr and secondary != nullptr) or primary == secondary) {
-            // Another thread is currently allocating a new secondary table. 
-            // Use the pointer in the secondary table.
-            primary = std::exchange(secondary, nullptr);
+        const_pointer set(key_type const &key, value_type const &value) noexcept
+        {
+            return set(make_hash(key), key, value);
         }
 
-        tt_axiom(primary != nullptr);
-        return {primary, secondary};
-    }
+    private:
+        std::atomic<table_type *> _primary;
+        std::atomic<table_type *> _secondary;
+
+        allocator_type _allocator;
+
+        std::pair<table_type *, table_type *> get_tables() const noexcept
+        {
+            // During allocation on the other thread, the secondary will first
+            // get a copy before the primary get set to nullptr. By loading
+            // in this order we get the values in a consistant order.
+            auto *primary = _primary.load(std::memory_order::acquire);
+            auto *secondary = _secondary.load(std::memory_order::acquire);
+
+            if ((primary == nullptr and secondary != nullptr) or primary == secondary) {
+                // Another thread is currently allocating a new secondary table. 
+                // Use the pointer in the secondary table.
+                primary = std::exchange(secondary, nullptr);
+            }
+
+            tt_axiom(primary != nullptr);
+            return {primary, secondary};
+        }
 
 };
 
