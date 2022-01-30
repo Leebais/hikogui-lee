@@ -12,42 +12,65 @@
 
 
 //
-// Get:
-//   Walk forward, remember last match, tombstone previous match.
-//   On empty
+// Get: (Return first match)
+//   From begin walk forward
+//   On match
 //     Return match
+//   On empty
+//     Return null
 //
 // Remove:
-//   Walk forward tombstone every match
-//
-// Set:
-//   Walk forward, remember last match, tombstone previous match.
-//   On old-tombstone
-//     Reserve
-//     Write key/value
-//     Make read-available
-//     Remove duplicates forward
-//     Commit
-//   On empty
-//     Reserve
-//     Write key/value
-//     Commit
-//
-// Try-Set:
-//   Walk forward
+//   From end walk backward
+//   On 3rd generation tombstone
+//     # The `set` operation must always have a generation that will reclaim these tombstones at the same time.
+//     If lowest slot index is larger then current slot.
+//       # Another `set` operation may have won, in that case there are no more 3rd generation tombstones, just continue.
+//       # Another `remove` operation may have won, just continue.
+//       # `get` operation don't race
+//       Empty
 //   On match
-//    Stop
-//   On old-tombstone
+//     Remember match
+//     # `get` operations look forward, by tombstoning backward we are removing older versions first.
+//     # `set` operations don't race
+//     # `remove` operations don't race
+//     Tombstone
+//   On used
+//     Remember lowest slot index.
+//   Return match
+// 
+// Set<"try">:
+//   From begin walk forward
+//   On match and if "try"
+//     # If we made a reservation we can re-tombstone the reservation with the generation we remembered
+//     # this way the slot can be reused or re-claimed quicker.
+//     # This tombstone can not be raced, do to exclusive access to a reserved slot.
+//     Tombstone reservation
+//     return match
+// 
+//   On 2nd generation tombstone
+//     Remember generation
 //     Reserve
-//     Write key/value
-//     Commit
+//     if Reserve failed to Empty
+//        goto On empty 
+// 
 //   On empty
-//     Reserve
+//     If no reservation
+//       # Another `set` operation may have won. Then continue walking forward.
+//       Reserve empty
+//       if Reserve failed
+//         continue
+// 
 //     Write key/value
+//     # Protect the new value from being `removed` until duplicate values are removed.
+//     Commit read-only
+//     last_match = Call `remove`
 //     Commit
-//
-//                 000: Empty
-//                 001: Reserved
+//     # Return null on "try" because a race condition may case remove to return a match.
+//     return null if "try" else last_match
+// 
+// 
+//             <0s>000: Empty
+//     <generation>001: Reserved
 //     <generation>010: Tombstone
 //                 011:
 //           <hash>100: Read-only
@@ -118,15 +141,6 @@ class wfree_hash_map_slot {
         return *ptr;
     }
 
-    /** The hash value of this slot.
-     *
-     * Values:
-     *  - 0: Empty
-     *  - 1: Reserved
-     *  - 2: Tomb-stone
-     *  - other: Comitted.
-     *
-     */
     [[nodiscard]] size_t hash() const noexcept
     {
         return _hash.load(std::memory_order::acquire);
@@ -148,29 +162,49 @@ class wfree_hash_map_slot {
         return item().value;
     }
 
+    /** Set the slot to empty.
+     * 
+     * @note It is undefined behavior when old_value is not a tombstone.
+     * @param old_value The old value that was loaded during processing of slots.
+     * @return True when the slot was marked empty.
+     */
+    bool set_empty(uint64_t old_value) noexcept
+    {
+        tt_axiom(old_value & 0b010);
+        // The previous tombstone was already stored using memory_order::release
+        return _hash.compare_exchange_strong(old_value, 0, std::memory_order::relaxed);
+    }
+
+    /** Set the slot of tombstone.
+     * 
+     * @note It is undefined behavior when old_value is not used or reserved.
+     * @param old_value The old value that was loaded during processing of slots.
+     * @param generation The generation value to store. Must end with 0b010.
+     * @return True when the slot was marked empty.
+     */
+    bool set_tombstone(uint64_t old_value, uint64_t generation) noexcept
+    {
+        tt_axiom(old_value == 1 or (old_value & 0b100));
+        tt_axiom((generation & 0b111) == 0b010);
+        return _hash.compare_exchange_strong(old_value, generation);
+    }
+
     /** Reserve the slot.
      *
-     * A thread reserves a slot before calling `emplace()`.
-     *
-     * @return true if the slot is now reserved.
+     * @note It is undefined behaviour when old_value is not empty or tombstone.
+     * @param old_value The old value that was loaded during processing of slots.
+     * @return The value loaded before => old_value: success, 0: empty, , otherwise: fail.
      */
-    [[nodiscard]] bool reserve() noexcept
+    uint64_t set_reserve(uint64_t old_value) noexcept
     {
-        size_t expected = 0;
-        return _hash.compare_exchange_strong(expected, 1, std::memory_order::acquire);
+        auto expected = old_value;
+        if (_hash.compare_exchange_strong(expected, 1)) {
+            return old_value;
+        } else {
+            return expected;
+        }
     }
-
-    /** Entomb a slot.
-     *
-     * @pre `emplace()` or `reserve()` must be called first.
-     * @return True if this call entombed the slot, so that decrement is allowed.
-     */
-    [[nodiscard]] bool entomb() noexcept
-    {
-        tt_axiom(_hash.load(std::memory_order::relaxed) != 0);
-        return _hash.except(2, std::memory_order::relaxed) != 2;
-    }
-
+    
     /** Destroy the item.
      *
      * @pre All slot's of the table must be empty, reseved or entombed.
@@ -178,11 +212,7 @@ class wfree_hash_map_slot {
      */
     void destroy() noexcept
     {
-        tt_axiom(_hash.load(std::memory_order::relaxed) <= 2);
-        if (_hash.load(std::memory_order::acquire) > 1) {
-            std::destroy_at(item_ptr());
-            _hash.store(0, std::memory_order::release);
-        }
+        std::destroy_at(item_ptr());
     }
 
     /** Create a key/value in the slot.
@@ -206,7 +236,7 @@ class wfree_hash_map_slot {
     }
 
 private:
-    std::atomic<size_t> _hash;
+    std::atomic<uint64_t> _hash;
     alignas(item_type) std::array<char, sizeof(item_type)> _buffer;
 };
 
@@ -429,57 +459,100 @@ struct wfree_hash_map_table : wfree_hash_map_header {
         }
     }
 
-    /** Find a key in the table.
-     *
-     * @note Duplicate keys are removed from the table.
-     * @param key The key to search for.
-     * @param hash The hash of the key.
-     * @return The slot found, end() when reserved slot found, or nullptr when not found. pointer to entry after block.
-     */
-    template<bool StopAtReserved=false>
-    std::pair<slot_type *, slot_type *> find(key_type const &key, size_t hash) noexcept
-    {
-        slot_type *it = first_slot(hash);
-        slot_type *found = nullptr;
-        while (true) {
-            ttlet h = it->hash();
-            if (h == 0 or (StopAtReserved and h == 1)) {
-                return {found, it};
-
-            } else if (h == hash and key_equal{}(it->key(), key)) {
-                // Remove duplicate keys.
-                if (found and found->entomb()) {
-                    increment_tombstones();
-                }
-                found = it;
-            }
-            it = increment_slot(it);
-        }
-        tt_not_reached();
-    }
-
     /** Search for the key in the table.
      *
-     * @note Duplicate keys are removed from the table.
      * @param key The key to search for.
-     * @param hash The hash of the key.
+     * @param hash The hash of the key. Bottom 3 bits must be '100'.
      * @return The slot that matches the key, or nullptr
      */
-    slot_type *get(key_type const &key, size_t hash) noexcept
+    slot_type *get(key_type const &key, uint64_t hash) noexcept
     {
-        ttlet[found, it] = find(key, hash);
+        slot_type *it = first_slot(hash);
+        while (auto h = it->hash()) {
+            if ((h ^ hash) <= 1) {
+                return it;
+            }
+
+            it = increment_slot(it);
+        }
+        return nullptr;
+    }
+
+    /** Remove a key from the table.
+     *
+     * @note Duplicate keys are removed from the table.
+     * @param first The first slot matching the key.
+     * @param last One beyond the last slot matching the key.
+     * @param key The key to remove from the table.
+     * @param hash The hash of the key lower bits must '100'.
+     * @param generation The current generation. lower bits must be '010'.
+     * @return The previous matching slot.
+     */
+    slot_type *remove(slot_type *first, slot_type *last, key_type const &key, uint64_t hash, uint64_t generation) noexcept
+    {
+        // We are checking for tombstones of 3 generations older.
+        ttlet old_generation = generation - (3 << 3);
+
+        auto it = last;
+        auto lowest_slot = last;
+        slot_type *found = nullptr;
+        do {
+            it = decrement_slot(it);
+
+            auto h = it->hash();
+            if ((h & 7) == 2 and h <= old_generation and it < lowest_slot) {
+                // Found a tombstone of more than 3 generations old.
+                // 
+                // This works because `set` iterates forward and uses 2nd generation slots and on contention:
+                // - When `set()` wins it will use the slot.
+                // - When `set()` looses it will see an empty slot that it will now use.
+                // - In either case there will be no other 3rd generation slots left for this thread to reclaim.
+                //
+                // If there is no contention with `set` it can reclaim multiple 3rd generation slots.
+                if (it->set_empty(h)) {
+                    it->destroy();
+                    decrement_tombstones();
+                }
+
+            } else if (h == hash and key_equal{}(it->key(), key)) {
+                // Found a match that is read-write.
+                found = it;
+                if (it->set_tombstone(h, generation)) {
+                    increment_tombstones();
+                }
+
+            } else if (h & 0b100) {
+                // Found a used slot, check where its location was supposed to be.
+                inplace_min(lowest_slot, first_slot(h));
+            }
+
+        } while (it != first);
+
         return found;
+    }
+
+    /** Remove a key from the table.
+     *
+     * @note Duplicate keys are removed from the table.
+     * @param key The key to remove from the table.
+     * @param hash The hash of the key lower bits must '100'.
+     * @param generation The current generation. lower bits must be '010'.
+     * @return The previous matching slot.
+     */
+    slot_type *remove(key_type const &key, uint64_t hash, uint64_t generation) noexcept {
+
     }
 
     /** Set a new key value in the table, overwriting existing.
      *
      * @note Duplicate keys are removed from the table.
+     * @tparam Try If true then set will not insert the key if it already exists.
      * @param key The key to add to the table.
      * @param value The value to add to the table.
      * @param hash The hash of the key.
      * @return The previous matching slot.
      */
-    template<forward_for<key_type> Key, forward_for<value_type> Value>
+    template<forward_for<key_type> Key, forward_for<value_type> Value, bool Try>
     slot_type *set(Key &&key, Value &&value, size_t hash) noexcept
     {
         auto [found, it] = find(key, hash);
@@ -493,43 +566,9 @@ struct wfree_hash_map_table : wfree_hash_map_header {
         return nullptr;
     }
 
-    /** Set a new key value in the table, unless the key is already in the table.
-     *
-     * @note Duplicate keys are removed from the table.
-     * @param key The key to add to the table.
-     * @param value The value to add to the table.
-     * @param hash The hash of the key.
-     * @return The previous matching slot.
-     */
-    template<forward_for<key_type> Key, forward_for<value_type> Value>
-    slot_type *try_set(Key &&key, Value &&value, size_t hash) noexcept
-    {
-        auto [found, it] = find(key, hash);
-        if (found) {
-            return found;
-        }
+    
 
-        it = reserve_slot<StopAtReserved>(it);
-        increment_reservations();
-        it->emplace(std::forward<Key>(key), std::forward<Value>(value), hash);
-        return nullptr;
-    }
-
-    /** Remove a key from the table.
-     * 
-     * @note Duplicate keys are removed from the table.
-     * @param key The key to remove from the table.
-     * @param hash The hash of the key.
-     * @return The previous matching slot.
-     */
-    slot_type *remove(key_type const &key, size_t hash) noexcept
-    {
-        ttlet[found, it] = find(key, hash);
-        if (found and found->entomb()) {
-            increment_tombstones();
-        }
-        return found;
-    }
+    
 
     /** Move and entry from another hash map table.
     * 
