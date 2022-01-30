@@ -10,9 +10,55 @@
 #include <cstdint>
 #include <cstddef>
 
+
+//
+// Get:
+//   Walk forward, remember last match, tombstone previous match.
+//   On empty
+//     Return match
+//
+// Remove:
+//   Walk forward tombstone every match
+//
+// Set:
+//   Walk forward, remember last match, tombstone previous match.
+//   On old-tombstone
+//     Reserve
+//     Write key/value
+//     Make read-available
+//     Remove duplicates forward
+//     Commit
+//   On empty
+//     Reserve
+//     Write key/value
+//     Commit
+//
+// Try-Set:
+//   Walk forward
+//   On match
+//    Stop
+//   On old-tombstone
+//     Reserve
+//     Write key/value
+//     Commit
+//   On empty
+//     Reserve
+//     Write key/value
+//     Commit
+//
+//                 000: Empty
+//                 001: Reserved
+//     <generation>010: Tombstone
+//                 011:
+//           <hash>100: Read-only
+//           <hash>101: Committed
+//                 110:
+//                 111:
+
+
 namespace tt::inline v1{
 
-    namespace detail {
+namespace detail {
 
 template<typename K, typename V>
 struct wfree_hash_map_item {
@@ -34,48 +80,15 @@ struct wfree_hash_map_item {
 };
 
 template<typename K, typename V>
-struct wfree_hash_map_slot {
+class wfree_hash_map_slot {
     using key_type = K;
     using value_type = V;
     using item_type = wfree_hash_map_item<key_type, value_type>;
 
-    /** The hash key and state.
-     *
-     * Values:
-     *  - 0: Empty
-     *  - 1: Reserved
-     *  - 2: Tomb stone
-     *  - other: Key/Value are valid.
-     *
-     * Get operation:
-     *  - Find all slots with same key (forward).
-     *  - Entomb all found slots but the last one.
-     *  - Return the item of the last slot.
-     *
-     * Set operation:
-     *  - Find previous slots with same key (forward).
-     *  - Reserve failed slot after the last found, or reserve empty slot.
-     *  - Create key/value pair.
-     *  - Set hash value.
-     *  - Entomb any previous values.
-     *
-     * Try-set operation:
-     *  - Find slots with same key, if found stop.
-     *  - Reserve first failed slot, or reserve empty slot.
-     *  - Create key/value pair.
-     *  - Set hash value.
-     *
-     * Remove operation:
-     *  - Find all slots with the same key (forward).
-     *  - Entomb any found slot in order.
-     *
-     *
-     */
-    std::atomic<size_t> _hash;
-    alignas(item_type) std::array<char, sizeof(item_type)> _buffer;
 
     ~wfree_hash_map_slot() noexcept
     {
+        // If the slot has a tomb-stone or is comitted we have to destroy the item.
         if (_hash.load(std::memory_order::acquire) > 1) {
             std::destroy_at(item_ptr());
         }
@@ -103,6 +116,20 @@ struct wfree_hash_map_slot {
         ttlet ptr = item_ptr();
         tt_axiom(ptr != nullptr);
         return *ptr;
+    }
+
+    /** The hash value of this slot.
+     *
+     * Values:
+     *  - 0: Empty
+     *  - 1: Reserved
+     *  - 2: Tomb-stone
+     *  - other: Comitted.
+     *
+     */
+    [[nodiscard]] size_t hash() const noexcept
+    {
+        return _hash.load(std::memory_order::acquire);
     }
 
     /** Get a reference to the key of the slot.
@@ -177,6 +204,10 @@ struct wfree_hash_map_slot {
         std::construct_at(item_ptr(), std::forward<Key>(key), std::forward<Value>(value));
         _hash.store(hash, std::memory_order::release);
     }
+
+private:
+    std::atomic<size_t> _hash;
+    alignas(item_type) std::array<char, sizeof(item_type)> _buffer;
 };
 
 struct wfree_hash_map_header {
@@ -186,6 +217,7 @@ struct wfree_hash_map_header {
     std::atomic<size_t> num_tombstones;
     std::atomic<size_t> clean_index;
     std::atomic<size_t> use_count;
+    std::atomic<size_t> generation;
 
     wfree_hash_map_header(wfree_hash_map_header const &) = delete;
     wfree_hash_map_header(wfree_hash_map_header &&) = delete;
@@ -206,10 +238,17 @@ struct wfree_hash_map_header {
     }
 
     /** Increment the use count on the secondary table.
+     *
+     * @return Current generation, used for reclaiming.
+     *         No other thread has a generation number two lower than this value.
      */
-    void increment_use_count() noexcept
+    size_t increment_use_count() noexcept
     {
-        use_count.fetch_add(1, std::memory_order::acquire);
+        if (use_count.fetch_add(1, std::memory_order::relaxed) == 0) {
+            return generation.fetch_add(1, std::memory_order::acquire) + 1;
+        } else {
+            return generation.load(std::memory_order::acquire);
+        }
     }
 
     /** Decrement the use count on the secondary table.
@@ -220,80 +259,119 @@ struct wfree_hash_map_header {
     }
 };
 
-template<typename T>
-class wfree_hash_map_pointer {
+/** A proxy object to a hash map slot.
+ *
+ * This object maintains a use-count with the specific hash table.
+ */
+template<typename S>
+class wfree_hash_map_proxy {
 public:
-    using value_type = T;
+    using slot_type = T;
 
-    ~wfree_hash_map_pointer()
+    /** Destruct the proxy object.
+     *
+     * @note decrements use count of table.
+     */
+    ~wfree_hash_map_proxy()
     {
         if (_table) {
             _table->decrement_use_count();
         }
     }
 
-    wfree_hash_map_pointer(wfree_hash_map_pointer const &other) noexcept : _table(other._table), _ptr(other._ptr)
+    /** Copies the proxy object.
+     *
+     * @note increments use count of table.
+     */
+    wfree_hash_map_proxy(wfree_hash_map_proxy const &other) noexcept : _table(other._table), _slot(other._slot)
     {
         if (_table) {
             _table->increment_use_count();
         }
     }
 
-    wfree_hash_map_pointer &operator=(wfree_hash_map_pointer const &other) noexcept
+    /** Assigns a copy of the proxy object.
+     *
+     * @note decrement use count of previous table.
+     * @note increments use count of table.
+     */
+    wfree_hash_map_proxy &operator=(wfree_hash_map_proxy const &other) noexcept
     {
         if (_table != _other._table) {
             if (_table) {
                 _table->decrement_use_count();
             }
-            _secondary = other._secondary;
+            _table = other._table;
             if (_table) {
                 _table->increment_use_count();
             }
         }
-        _ptr = other._ptr;
+        _slot = other._slot;
     }
 
-    wfree_hash_map_pointer(wfree_hash_map_pointer &&other) noexcept :
-        _table(std::exchange(other._table, nullptr)), _ptr(std::exchange(other._ptr, nullptr))
+    /** Moves the proxy object.
+     */
+    wfree_hash_map_proxy(wfree_hash_map_proxy &&other) noexcept :
+        _table(std::exchange(other._table, nullptr)), _slot(std::exchange(other._slot, nullptr))
     {}
 
-    wfree_hash_map_pointer &operator=(wfree_hash_map_pointer &&other) noexcept
+    /** Assignes by moving the proxy object.
+     *
+     * @note decrements use count of previous table.
+     */
+    wfree_hash_map_proxy &operator=(wfree_hash_map_proxy &&other) noexcept
     {
         if (_table) {
             _table->decrement_use_count();
         }
         _table = std::exchange(other._table, nullptr);
-        _ptr = std::exchange(other._ptr, nullptr);
+        _slot = std::exchange(other._slot, nullptr);
     }
 
-    [[nodiscard]] static wfree_hash_map_pointer make_pointer(wfree_hash_map_header *table, T *ptr)
+    /** Construct a pointer.
+     *
+     * @note This constructor takes ownership of the use count of the caller.
+     * @pre table->increment_use_count() must be called before.
+     * @param secondary Pointer to the secondary table or nullptr.
+     * @param ptr The pointer to the value.
+     */
+    wfree_hash_map_proxy(wfree_hash_map_header *table, slot_type const *slot) noexcept : _table(table), _slot(slot) {}
+
+    [[nodiscard]] bool empty() const noexcept
     {
-        return wfree_hash_map_pointer{table, ptr};
+        return _slot == nullptr;
     }
 
-    value_type *operator->() noexcept
+    explicit operator bool() const noexcept
     {
-        return _ptr;
+        return not empty();
     }
 
-    value_type &operator*() noexcept
+    [[nodiscard]] slot_type::key_type const &key() const noexcept
     {
-        return *_ptr;
+        tt_axiom(_slot != nullptr);
+        return _slot->key();
+    }
+
+    [[nodiscard]] slot_type::value_type const &value() const noexcept
+    {
+        tt_axiom(_slot != nullptr);
+        return _slot->value();
+    }
+
+    slot_type::value_type const *operator->() const noexcept
+    {
+        return &value();
+    }
+
+    slot_type::value_type const &operator*() const noexcept
+    {
+        return value();
     }
 
 private:
     wfree_hash_map_header *_table;
-    value_type *_ptr;
-
-    /** Construct a pointer.
-     *
-     * @pre secondary->increment_ref_count() must be called first.
-     * @param secondary Pointer to the secondary table or nullptr
-     * @param ptr The pointer to the value.
-     */
-    wfree_hash_map_pointer(wfree_hash_map_header *table, T *ptr) noexcept :
-        _table(table), _ptr(ptr)
-    {}
+    slot_type const *_slot;
 };
 
 template<typename K, typename V, typename KeyEqual>
