@@ -175,6 +175,18 @@ class wfree_hash_map_slot {
         return _hash.compare_exchange_strong(old_value, 0, std::memory_order::relaxed);
     }
 
+    /** Return the generation of a tombstone.
+     *
+     * @param hash The hash value retrieved from a slot.
+     * @return Generation of the tombstone, or the maximum value if not a tombstone.
+     */
+    [[nodiscard]] static constexpr uint64_t tombstone_generation(uint64_t hash) noexcept
+    {
+        ttlet is_tombstone = static_cast<uint64_t>((hash & 7) == 2);
+        ttlet is_not_tombstone_mask = is_tombstone - 1;
+        return hash | is_not_tombstone_mask;
+    }
+
     /** Set the slot of tombstone.
      * 
      * @note It is undefined behavior when old_value is not used or reserved.
@@ -193,16 +205,41 @@ class wfree_hash_map_slot {
      *
      * @note It is undefined behaviour when old_value is not empty or tombstone.
      * @param old_value The old value that was loaded during processing of slots.
-     * @return The value loaded before => old_value: success, 0: empty, , otherwise: fail.
+     * @return The value loaded before => old_value: success, 0: empty, otherwise: fail.
      */
-    uint64_t set_reserve(uint64_t old_value) noexcept
+    [[nodiscard]] uint64_t set_reserve(uint64_t old_value) noexcept
     {
+        tt_axiom(old_value == 0 or (old_value & 0b010));
         auto expected = old_value;
         if (_hash.compare_exchange_strong(expected, 1)) {
             return old_value;
         } else {
             return expected;
         }
+    }
+
+    /** Commit the slot as read-only
+     *
+     * @note It is undefined behavior if the slot is not reserved.
+     * @param hash The hash value to use, must end in 0b100.
+     */
+    void set_commit_read_only(uint64_t hash) noexcept
+    {
+        tt_axiom(hash & 7 == 0b00);
+        tt_axion(_hash.load(std::memory_order_relaxed) == 1);
+        _hash.store(hash | 1, std::memory_order_release); 
+    }
+
+    /** Commit the slot as read-only
+     *
+     * @note It is undefined behavior if the slot is not comitted as read-only.
+     * @param hash The hash value to use, must end in 0b100.
+     */
+    void set_commit(uint64_t hash) noexcept
+    {
+        tt_axiom(hash & 7 == 0b00);
+        tt_axion(_hash.load(std::memory_order_relaxed) == (hash | 1));
+        _hash.store(hash | 1, std::memory_order_relaxed); 
     }
     
     /** Destroy the item.
@@ -236,6 +273,16 @@ class wfree_hash_map_slot {
     }
 
 private:
+    /** Hash value.
+     *
+     *   Bit patterns    | Test             | Description
+     *   ---------------:|:---------------- |:------------------
+     *                 0 | h == 0           | Empty
+     *                 1 | h == 1           | Reserved
+     *   <generation>010 | h & 2            | Tombstone
+     *         <hash>100 | h == hash        | Comitted
+     *         <hash>101 | h ^ hash <= 1    | Comitted read-only
+     */
     std::atomic<uint64_t> _hash;
     alignas(item_type) std::array<char, sizeof(item_type)> _buffer;
 };
@@ -405,19 +452,22 @@ private:
 };
 
 template<typename K, typename V, typename KeyEqual>
-struct wfree_hash_map_table : wfree_hash_map_header {
+class wfree_hash_map_table : public wfree_hash_map_header {
+public:
     using key_type = K;
     using value_type = V;
     using slot_type = wfree_hash_map_slot<key_type, value_type>;
     using key_equal = KeyEqual;
     constexpr size_t data_offset = tt::ceil(sizeof(wfree_hash_map_header), sizeof(slot_type));
+    constexpr size_t slot_offset = data_offset / sizeof(slot_type);
 
     ~wfree_hash_map_table() noexcept
     {
         std::destroy(begin(), end());
     }
 
-    wfree_hash_map_table(size_t capacity) noexcept : wfree_hash_map_header(capacity)
+    wfree_hash_map_table(size_t capacity) noexcept :
+        wfree_hash_map_header(capacity), _end(begin() + capacity)
     {
         for (auto it = begin(); it != end(); ++it) {
             std::construct_at(it);
@@ -426,37 +476,70 @@ struct wfree_hash_map_table : wfree_hash_map_header {
 
     slot_type *begin() noexcept
     {
-        auto *data = reinterpret_cast<char *>(this) + data_offset;
-        return reinterpret_cast<wfree_hash_map_item *>(data);
+        return reinterpret_cast<slot_type *>(this) + slot_offset;
+    }
+
+    slot_type const *begin() const noexcept
+    {
+        return reinterpret_cast<slot_type const *>(this) + slot_offset;
     }
 
     slot_type *end() noexcept
     {
-        return begin() + capacity;
+        return _end;
     }
 
-    slot_type *first_slot(size_t hash) noexcept
+    slot_type const *end() const noexcept
     {
-        ttlet index = (hash >> 2) % capacity;
+        return _end;
+    }
+
+    [[nodiscard]] slot_type *increment_slot(slot_type *it) const noexcept
+    {
+        return ++it == end() ? begin() : it;
+    }
+
+    [[nodiscard]] slot_type const *increment_slot(slot_type const *it) const noexcept
+    {
+        return ++it == end() ? begin() : it;
+    }
+
+    [[nodiscard]] slot_type *decrement_slot(slot_type *it) const noexcept
+    {
+        return it-- == begin() ? end() - 1 : it;
+    }
+
+    [[nodiscard]] slot_type const *decrement_slot(slot_type const *it) const noexcept
+    {
+        return it-- == begin() ? end() - 1 : it;
+    }
+
+    [[nodiscard]] slot_type *first_slot(size_t hash) noexcept
+    {
+        ttlet index = (hash >> 3) % capacity;
         return begin() + index;
     }
 
-    slot_type *increment_slot(slot_type *it) noexcept
+    [[nodiscard]] slot_type const *first_slot(size_t hash) const noexcept
     {
-        ++it;
-        return it == end() ? begin() : it;
+        ttlet index = (hash >> 3) % capacity;
+        return begin() + index;
     }
 
-    [[nodiscard]] slot_type *reserve_slot(slot_type *it) noexcept
+    [[nodiscard]] slot_type *last_slot(slot_type *it) const noexcept
     {
-        tt_axiom(it != nullptr);
-
-        while (true) {
-            if (it.reserve()) {
-                return it;
-            }
-            it = incement_slot(it);
+        while (it->hash()) {
+            it = increment_slot(it);
         }
+        return it;
+    }
+
+    [[nodiscard]] slot_type const *last_slot(slot_type const *it) const noexcept
+    {
+        while (it->hash()) {
+            it = increment_slot(it);
+        }
+        return it;
     }
 
     /** Search for the key in the table.
@@ -465,7 +548,7 @@ struct wfree_hash_map_table : wfree_hash_map_header {
      * @param hash The hash of the key. Bottom 3 bits must be '100'.
      * @return The slot that matches the key, or nullptr
      */
-    slot_type *get(key_type const &key, uint64_t hash) noexcept
+    slot_type const *get(key_type const &key, uint64_t hash) const noexcept
     {
         slot_type *it = first_slot(hash);
         while (auto h = it->hash()) {
@@ -480,7 +563,6 @@ struct wfree_hash_map_table : wfree_hash_map_header {
 
     /** Remove a key from the table.
      *
-     * @note Duplicate keys are removed from the table.
      * @param first The first slot matching the key.
      * @param last One beyond the last slot matching the key.
      * @param key The key to remove from the table.
@@ -498,9 +580,9 @@ struct wfree_hash_map_table : wfree_hash_map_header {
         slot_type *found = nullptr;
         do {
             it = decrement_slot(it);
+            ttlet h = it->hash();
 
-            auto h = it->hash();
-            if ((h & 7) == 2 and h <= old_generation and it < lowest_slot) {
+            if (slot_type::tombstone_generation(h) <= old_generation and it < lowest_slot and it->set_empty(h)) {
                 // Found a tombstone of more than 3 generations old.
                 // 
                 // This works because `set` iterates forward and uses 2nd generation slots and on contention:
@@ -509,10 +591,8 @@ struct wfree_hash_map_table : wfree_hash_map_header {
                 // - In either case there will be no other 3rd generation slots left for this thread to reclaim.
                 //
                 // If there is no contention with `set` it can reclaim multiple 3rd generation slots.
-                if (it->set_empty(h)) {
-                    it->destroy();
-                    decrement_tombstones();
-                }
+                it->destroy();
+                decrement_tombstones();
 
             } else if (h == hash and key_equal{}(it->key(), key)) {
                 // Found a match that is read-write.
@@ -533,37 +613,74 @@ struct wfree_hash_map_table : wfree_hash_map_header {
 
     /** Remove a key from the table.
      *
-     * @note Duplicate keys are removed from the table.
      * @param key The key to remove from the table.
      * @param hash The hash of the key lower bits must '100'.
      * @param generation The current generation. lower bits must be '010'.
      * @return The previous matching slot.
      */
-    slot_type *remove(key_type const &key, uint64_t hash, uint64_t generation) noexcept {
-
+    slot_type *remove(key_type const &key, uint64_t hash, uint64_t generation) noexcept
+    {
+        auto first = first_slot(hash);
+        auto last = last_slot(first);
+        return remove(first, last, key, hash, generation);
     }
 
     /** Set a new key value in the table, overwriting existing.
      *
-     * @note Duplicate keys are removed from the table.
      * @tparam Try If true then set will not insert the key if it already exists.
      * @param key The key to add to the table.
      * @param value The value to add to the table.
      * @param hash The hash of the key.
      * @return The previous matching slot.
      */
-    template<forward_for<key_type> Key, forward_for<value_type> Value, bool Try>
-    slot_type *set(Key &&key, Value &&value, size_t hash) noexcept
+    template<forward_for<value_type> Value, bool Try>
+    slot_type *set(key_type const &key, Value &&value, uint64_t hash, uint64_t generation) noexcept
     {
-        auto [found, it] = find(key, hash);
-        auto it = reserve_slot(first);
-        increment_reservations();
-        it->emplace(std::forward<Key>(key), std::forward<Value>(value), hash);
+        // We are checking for tombstones of 2 generations older.
+        ttlet old_generation = generation - (2 << 3);
 
-        if (found and found->entomb()) {
-            increment_tombstones();
+        ttlet first = first_slot(hash);
+        auto it = first;
+        slot_type *reserved = nullptr;
+        while (not reserved) {
+            ttlet h = it->hash();
+
+            if (slot_type::tombstone_generaton(h) <= old_generation) {
+                ttlet result = it->set_reserve(h);
+
+                // Due to race with `remove()` the tombstone may have be reclaimed and the slot was empty.
+                if (result == h or (result == 0 and it->set_reserve(result) == 0)) {
+                    // Successfully Reserved.
+                    increment_reservations();
+                    reserved = it;
+                }
+
+            } else if (Try and (h ^ hash) <= 1 and key_equal{}(it->key, key)) {
+                // Found match, don't set the value.
+                return it;
+
+            } else if (h == 0 and it->set_reserve(h) == 0) {
+                // Successfully reserved.
+                increment_reservations();
+                reserved = it;
+            }
+
+            it = increment_slot(it);
         }
-        return nullptr;
+     
+        // Start using the reserved slot. Commit as read-only so that it won't get removed.   
+        reserved->emplace(key, std::forward<Value>(value));
+        // Commit as read-only; can not be deleted by `remove()`, but it get be found with `get()`.
+        reserved->set_commit_read_only(hash);
+
+        // Go all the way to the end, then execute a remove to remove duplicates..
+        ttlet last = last_slot(it);
+        ttlet match = remove(first, last, key, hash, generation);
+
+        // Fully commit, it may now be deleted.
+        reserved->set_commit(hash);
+
+        return Try ? nullptr : match;
     }
 
     
@@ -640,6 +757,9 @@ struct wfree_hash_map_table : wfree_hash_map_header {
         std::destroy_at(table_ptr);
         std::allocator_traits<Allocator>::deallocate(allocator, reinterpret_cast<char *>(table_ptr), capacity_to_num_bytes(capacity));
     }
+
+private:
+    const slot_type *_end;
 };
 static_assert(sizeof(wfree_hash_map_header) == sizeof(wfree_hash_map_table));
 
@@ -698,24 +818,21 @@ template<
             ttlet [primary, secondary] = get_tables();
 
             // Search the primary table for matching entries.
-            primary->increment_use_count();
+            increment_use_count();
             if (ttlet found = primary->get(key, hash)) {
-                return {primary, found};
+                return {this, found};
             }
 
             // Search the secondary table for matching entries
             // Move the entry to the primary table and return the new primary entry.
             if (secondary) {
-                secondary->increment_use_count();
                 if (ttlet found = secondary->get(key, hash)) {
                     ttlet new_ptr = primary->move_from(secondary, found, hash);
-                    secondary->decrement_use_count();
-                    return {primary, new_ptr};
+                    return {this, new_ptr};
                 }
-                secondary->decrement_use_count();   
             }
 
-            primary->decrement_use_count();
+            decrement_use_count();
             return {};
         }
 
