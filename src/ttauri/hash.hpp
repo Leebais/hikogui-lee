@@ -37,4 +37,21 @@ template<typename First, typename Second, typename... Args>
     }
 }
 
+
+template<std::unsigned_integral From, std::unsigned_integral To>
+[[nodiscard]] constexpr To hash_fold(From hash, size_t nr_bits = sizeof(To) * CHAR_BIT) noexcept
+{
+    tt_axiom(nr_bits <= sizeof(To) * CHAR_BIT);
+    tt_axiom(nr_bits <= sizeof(From) * CHAR_BIT);
+
+    auto index = From{};
+    do {
+        index += hash;
+        hash >>= nr_bits;
+    } while (hash);
+
+    ttlet mask = (To{1} << nr_bits) - To{1};
+    return static_cast<To>(index & mask);
+}
+
 } // namespace tt::inline v1

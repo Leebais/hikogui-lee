@@ -75,13 +75,40 @@
 //                 011:
 //           <hash>100: Read-only
 //           <hash>101: Committed
-//                 110:
+//           <hash>110:
 //                 111:
 
 
 namespace tt::inline v1{
 
 namespace detail {
+
+enum class wfree_hash_map_state {
+    /** Slot is empty and may be used.
+     */
+    empty = 0b000,
+
+    /** Slot is reserved by a thread.
+     */
+    reserved = 0b001,
+
+    /** Slot was deleted, but references still exists.
+     */
+    tombstone = 0b010,
+
+    /** Slot is being written by `set()`,
+     * `get()` will treat as-if comitted.
+     * `remove()` will ignore.
+     */
+    prepare_set = 0b100,
+
+    /** Slot is being written by `move()`.
+     * `get()` will report the first entry, if no other slots are comitted.
+     * `remove()` will ignore.
+     */
+    prepare_move = 0b101,
+    comitted = 0b111,
+};
 
 template<typename K, typename V>
 struct wfree_hash_map_item {
@@ -107,7 +134,6 @@ class wfree_hash_map_slot {
     using key_type = K;
     using value_type = V;
     using item_type = wfree_hash_map_item<key_type, value_type>;
-
 
     ~wfree_hash_map_slot() noexcept
     {
@@ -162,17 +188,29 @@ class wfree_hash_map_slot {
         return item().value;
     }
 
-    /** Set the slot to empty.
+    /** reclaim the slot and mark it empty.
      * 
      * @note It is undefined behavior when old_value is not a tombstone.
-     * @param old_value The old value that was loaded during processing of slots.
+     * @post If succesfully reclaimed, the stored key/value is destructed.
+     * @param state The value that was loaded during processing of slots.
      * @return True when the slot was marked empty.
      */
-    bool set_empty(uint64_t old_value) noexcept
+    bool reclaim(uint64_t state) noexcept
     {
-        tt_axiom(old_value & 0b010);
-        // The previous tombstone was already stored using memory_order::release
-        return _hash.compare_exchange_strong(old_value, 0, std::memory_order::relaxed);
+        tt_axiom(is_tombstone(state));
+
+        if (reserve(state)) {
+            std::destroy_at(item_ptr());
+            _hash.store(0, std::memory_order::release);
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    [[nodiscard]] constexpr bool is_tombstone(uint64_t state) const noexcept
+    {
+        return state & 0b111 == 0b010;
     }
 
     /** Return the generation of a tombstone.
@@ -180,11 +218,11 @@ class wfree_hash_map_slot {
      * @param hash The hash value retrieved from a slot.
      * @return Generation of the tombstone, or the maximum value if not a tombstone.
      */
-    [[nodiscard]] static constexpr uint64_t tombstone_generation(uint64_t hash) noexcept
+    [[nodiscard]] static constexpr uint64_t tombstone_generation(uint64_t state) noexcept
     {
-        ttlet is_tombstone = static_cast<uint64_t>((hash & 7) == 2);
+        ttlet is_tombstone = static_cast<uint64_t>(is_tombstone(state));
         ttlet is_not_tombstone_mask = is_tombstone - 1;
-        return hash | is_not_tombstone_mask;
+        return (state | is_not_tombstone_mask) >> 3;
     }
 
     /** Set the slot of tombstone.
@@ -273,17 +311,7 @@ class wfree_hash_map_slot {
     }
 
 private:
-    /** Hash value.
-     *
-     *   Bit patterns    | Test             | Description
-     *   ---------------:|:---------------- |:------------------
-     *                 0 | h == 0           | Empty
-     *                 1 | h == 1           | Reserved
-     *   <generation>010 | h & 2            | Tombstone
-     *         <hash>100 | h == hash        | Comitted
-     *         <hash>101 | h ^ hash <= 1    | Comitted read-only
-     */
-    std::atomic<uint64_t> _hash;
+    std::atomic<uint64_t> _state;
     alignas(item_type) std::array<char, sizeof(item_type)> _buffer;
 };
 
@@ -293,8 +321,6 @@ struct wfree_hash_map_header {
     std::atomic<size_t> num_reservations;
     std::atomic<size_t> num_tombstones;
     std::atomic<size_t> clean_index;
-    std::atomic<size_t> use_count;
-    std::atomic<size_t> generation;
 
     wfree_hash_map_header(wfree_hash_map_header const &) = delete;
     wfree_hash_map_header(wfree_hash_map_header &&) = delete;
@@ -302,37 +328,43 @@ struct wfree_hash_map_header {
     wfree_hash_map_header &operator=(wfree_hash_map_header &&) = delete;
     wfree_hash_map_header(size_t capacity) noexcept :
         capacity(capacity), num_reservations(0), num_tombstones(0), clean_index(capacity + 1), use_count(0)
-    {}
+    {
+    }
 
     void increment_reservations() noexcept
     {
-        num_reservations.fetch_add(1, std::memory_order::acquire);
+        num_reservations.fetch_add(1, std::memory_order::relaxed);
+    }
+
+    void decrement_reservations() noexcept
+    {
+        num_reservations.fetch_sub(1, std::memory_order::relaxed);
     }
 
     void increment_tombstones() noexcept
     {
-        num_tombstones.fetch_add(1, std::memory_order::release);
+        num_tombstones.fetch_add(1, std::memory_order::relaxed);
     }
 
-    /** Increment the use count on the secondary table.
-     *
-     * @return Current generation, used for reclaiming.
-     *         No other thread has a generation number two lower than this value.
-     */
-    size_t increment_use_count() noexcept
+    void decrement_tombstones() noexcept
     {
-        if (use_count.fetch_add(1, std::memory_order::relaxed) == 0) {
-            return generation.fetch_add(1, std::memory_order::acquire) + 1;
-        } else {
-            return generation.load(std::memory_order::acquire);
+        num_tombstones.fetch_sub(1, std::memory_order::relaxed);
+    }
+
+    void size_t hash_to_index(uint64_t hash) noexcept
+    {
+        tt_axiom(std::popcount(capacity) == 1);
+        ttlet mask = capacity - 1;
+        ttlet shift = std:popcount(mask);
+
+        // Don't mind that the bottom 3 bits of the hash have no information,
+        uint64_t index = 0;
+        while (hash != 0) {
+            index += hash;
+            hash >>= shift;
         }
-    }
 
-    /** Decrement the use count on the secondary table.
-     */
-    void decrement_use_count() noexcept
-    {
-        use_count.fetch_sub(1, std::memory_order::release);
+        return static_cast<size_t>(index & mask);
     }
 };
 
@@ -516,14 +548,12 @@ public:
 
     [[nodiscard]] slot_type *first_slot(size_t hash) noexcept
     {
-        ttlet index = (hash >> 3) % capacity;
-        return begin() + index;
+        return begin() + hash_to_index(hash);
     }
 
     [[nodiscard]] slot_type const *first_slot(size_t hash) const noexcept
     {
-        ttlet index = (hash >> 3) % capacity;
-        return begin() + index;
+        return begin() + hash_to_index(hash);
     }
 
     [[nodiscard]] slot_type *last_slot(slot_type *it) const noexcept
@@ -670,7 +700,7 @@ public:
      
         // Start using the reserved slot. Commit as read-only so that it won't get removed.   
         reserved->emplace(key, std::forward<Value>(value));
-        // Commit as read-only; can not be deleted by `remove()`, but it get be found with `get()`.
+        // Commit as read-only; can not be deleted by `remove()`, but it can be found with `get()`.
         reserved->set_commit_read_only(hash);
 
         // Go all the way to the end, then execute a remove to remove duplicates..
@@ -903,9 +933,60 @@ template<
             return set(make_hash(key), key, value);
         }
 
+
+        [[nodiscard]] static constexpr unit64_t make_hash(key_type const &key) noexcept
+        {
+            auto hash = static_cast<uint64_t>(hasher{}(key));
+
+            // FNV hash, to create lots of upper bits for the next full width multiplication..
+            auto tmp = (hash ^ 14695981039346656037) * 1099511628211;
+
+            // Golden Ratio 64 bit.
+            auto [lo, hi] = mul_carry(tmp, 11400714819323198485);
+            // The upper 32 bits of lo and lower 32 bits of hi should have most information, simply mix them.
+            lo ^= hi;
+            // Hash value must end with 0b100.
+            lo <<= 3;
+            lo |= 0b100;
+            return lo;
+        }
+
+        /** Increment the use count.
+         *
+         * @return Current generation, used for reclaiming.
+         *         No other thread has a generation number two lower than this value.
+         */
+        [[nodiscard]] uint64_t increment_use_count_get_generation() noexcept
+        {
+            if (use_count.fetch_add(1, std::memory_order::relaxed) == 0) {
+                return generation.fetch_add(8, std::memory_order::acquire) + 8;
+            } else {
+                return generation.load(std::memory_order::acquire);
+            }
+        }
+
+        /** Increment the use count.
+         *
+         */
+        void increment_use_count() noexcept
+        {
+            if (use_count.fetch_add(1, std::memory_order::relaxed) == 0) {
+                generation.fetch_add(8, std::memory_order::acquire);
+            }
+        }
+
+        /** Decrement the use count.
+         */
+        void decrement_use_count() noexcept
+        {
+            use_count.fetch_sub(1, std::memory_order::release);
+        }
+
     private:
-        std::atomic<table_type *> _primary;
-        std::atomic<table_type *> _secondary;
+        std::atomic<uint64_t> use_count = 0;
+        std::atomic<uint64_t> generation = 0b010;;
+        std::atomic<table_type *> _primary = nullptr;
+        std::atomic<table_type *> _secondary = nullptr;
 
         allocator_type _allocator;
 
