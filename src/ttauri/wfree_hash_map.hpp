@@ -11,104 +11,9 @@
 #include <cstddef>
 
 
-//
-// Get: (Return first match)
-//   From begin walk forward
-//   On match
-//     Return match
-//   On empty
-//     Return null
-//
-// Remove:
-//   From end walk backward
-//   On 3rd generation tombstone
-//     # The `set` operation must always have a generation that will reclaim these tombstones at the same time.
-//     If lowest slot index is larger then current slot.
-//       # Another `set` operation may have won, in that case there are no more 3rd generation tombstones, just continue.
-//       # Another `remove` operation may have won, just continue.
-//       # `get` operation don't race
-//       Empty
-//   On match
-//     Remember match
-//     # `get` operations look forward, by tombstoning backward we are removing older versions first.
-//     # `set` operations don't race
-//     # `remove` operations don't race
-//     Tombstone
-//   On used
-//     Remember lowest slot index.
-//   Return match
-// 
-// Set<"try">:
-//   From begin walk forward
-//   On match and if "try"
-//     # If we made a reservation we can re-tombstone the reservation with the generation we remembered
-//     # this way the slot can be reused or re-claimed quicker.
-//     # This tombstone can not be raced, do to exclusive access to a reserved slot.
-//     Tombstone reservation
-//     return match
-// 
-//   On 2nd generation tombstone
-//     Remember generation
-//     Reserve
-//     if Reserve failed to Empty
-//        goto On empty 
-// 
-//   On empty
-//     If no reservation
-//       # Another `set` operation may have won. Then continue walking forward.
-//       Reserve empty
-//       if Reserve failed
-//         continue
-// 
-//     Write key/value
-//     # Protect the new value from being `removed` until duplicate values are removed.
-//     Commit read-only
-//     last_match = Call `remove`
-//     Commit
-//     # Return null on "try" because a race condition may case remove to return a match.
-//     return null if "try" else last_match
-// 
-// 
-//             <0s>000: Empty
-//     <generation>001: Reserved
-//     <generation>010: Tombstone
-//                 011:
-//           <hash>100: Read-only
-//           <hash>101: Committed
-//           <hash>110:
-//                 111:
-
-
-namespace tt::inline v1{
+namespace tt::inline v1 {
 
 namespace detail {
-
-enum class wfree_hash_map_state {
-    /** Slot is empty and may be used.
-     */
-    empty = 0b000,
-
-    /** Slot is reserved by a thread.
-     */
-    reserved = 0b001,
-
-    /** Slot was deleted, but references still exists.
-     */
-    tombstone = 0b010,
-
-    /** Slot is being written by `set()`,
-     * `get()` will treat as-if comitted.
-     * `remove()` will ignore.
-     */
-    prepare_set = 0b100,
-
-    /** Slot is being written by `move()`.
-     * `get()` will report the first entry, if no other slots are comitted.
-     * `remove()` will ignore.
-     */
-    prepare_move = 0b101,
-    comitted = 0b111,
-};
 
 template<typename K, typename V>
 struct wfree_hash_map_item {
@@ -137,9 +42,11 @@ class wfree_hash_map_slot {
 
     ~wfree_hash_map_slot() noexcept
     {
-        // If the slot has a tomb-stone or is comitted we have to destroy the item.
-        if (_hash.load(std::memory_order::acquire) > 1) {
-            std::destroy_at(item_ptr());
+        tt_axiom(_hash.load(std::memory_order::relaxed) != 1);
+
+        // If the slot isn't empty destroy the item.
+        if (_hash.load(std::memory_order::acquire) != 0) {
+            destroy();
         }
     }
 
@@ -159,24 +66,22 @@ class wfree_hash_map_slot {
         return reinterpret_cast<item_type *>(_buffer.data());
     }
 
+    [[nodiscard]] uint64_t state() const noexcept
+    {
+        return _state.load(std::memory_order::relaxed);
+    }
+
     [[nodiscard]] item_type &item() const noexcept
     {
-        tt_axiom(_hash.load(std::memory_order::relaxed) > 1);
         ttlet ptr = item_ptr();
         tt_axiom(ptr != nullptr);
         return *ptr;
-    }
-
-    [[nodiscard]] size_t hash() const noexcept
-    {
-        return _hash.load(std::memory_order::acquire);
     }
 
     /** Get a reference to the key of the slot.
      */
     [[nodiscard]] key_type const &key() const noexcept
     {
-        tt_axiom(_hash.load(std::memory_order::relaxed) > 1);
         return item().key;
     }
 
@@ -184,106 +89,103 @@ class wfree_hash_map_slot {
      */
     [[nodiscard]] value_type const &value() const noexcept
     {
-        tt_axiom(_hash.load(std::memory_order::relaxed) > 1);
         return item().value;
+    }
+
+    /** Reserve the slot.
+     *
+     * @note It is undefined behavior when this is not a tombstone or empty.
+     * @param state The loaded state.
+     * @return True if the slot has been reserved by this function.
+     */
+    [[nodiscard]] bool reserve(uint64_t state) noexcept
+    {
+        tt_axiom(state == 0 or (state & 0b110) == 0b010); // empty or tombstone.
+        return _hash.compare_exchange_strong(state, 1, std::memory_order::acquire, std::memory_order::relaxed);
+    }
+
+    template<bool DestroyItem>
+    [[nodiscard]] void clear() noexcept
+    {
+        if constexpr (DestroyItem) {
+            destroy();
+        }
+
+        _hash.store(0, std::memory_order::release);
     }
 
     /** reclaim the slot and mark it empty.
      * 
-     * @note It is undefined behavior when old_value is not a tombstone.
+     * @note It is undefined behavior when this is not a tombstone.
      * @post If succesfully reclaimed, the stored key/value is destructed.
      * @param state The value that was loaded during processing of slots.
      * @return True when the slot was marked empty.
      */
     bool reclaim(uint64_t state) noexcept
     {
-        tt_axiom(is_tombstone(state));
-
-        if (reserve(state)) {
-            std::destroy_at(item_ptr());
-            _hash.store(0, std::memory_order::release);
-            return true;
-        } else {
-            return false;
+        tt_axiom((state & 0b110) == 0b010); // tombstone.
+        auto reserved = reserve(state);
+        if (reserved) {
+            clear<true>();
         }
+        return reserved;
     }
 
-    [[nodiscard]] constexpr bool is_tombstone(uint64_t state) const noexcept
-    {
-        return state & 0b111 == 0b010;
-    }
-
-    /** Return the generation of a tombstone.
+    /** Check if this is an old tombstone.
      *
-     * @param hash The hash value retrieved from a slot.
-     * @return Generation of the tombstone, or the maximum value if not a tombstone.
+     * @return True if this is an old tombstone.
      */
-    [[nodiscard]] static constexpr uint64_t tombstone_generation(uint64_t state) noexcept
+    [[nodiscard]] constexpr bool is_old_tombstone(uint64_t state, uint64_t generation) const noexcept
     {
-        ttlet is_tombstone = static_cast<uint64_t>(is_tombstone(state));
-        ttlet is_not_tombstone_mask = is_tombstone - 1;
-        return (state | is_not_tombstone_mask) >> 3;
+        state ^= 0b010;
+        state = std::rotr(state, 3);
+        // If not a tombstone, one of the three top bits will be set and the value will be larger than current generation.
+        return state < generation;
     }
 
     /** Set the slot of tombstone.
      * 
      * @note It is undefined behavior when old_value is not used or reserved.
-     * @param old_value The old value that was loaded during processing of slots.
-     * @param generation The generation value to store. Must end with 0b010.
-     * @return True when the slot was marked empty.
+     * @param state The state that was loaded during processing of slots.
+     * @param generation The generation value to store.
+     * @return True when the slot was tombstoned.
      */
-    bool set_tombstone(uint64_t old_value, uint64_t generation) noexcept
+    [[nodiscard]] bool tombstone(uint64_t state, uint64_t generation) noexcept
     {
-        tt_axiom(old_value == 1 or (old_value & 0b100));
-        tt_axiom((generation & 0b111) == 0b010);
-        return _hash.compare_exchange_strong(old_value, generation);
+        tt_axiom(old_value == reserved or (old_value & 0b100));
+        tt_axiom(generation <= 0x1fff'ffff'ffff'ffff);
+        generation <<= 3;
+        generation |= 0b010;
+        return _hash.compare_exchange_strong(old_value, generation, std::memory_order::relaxed, std::memory_order::relaxed);
     }
 
-    /** Reserve the slot.
-     *
-     * @note It is undefined behaviour when old_value is not empty or tombstone.
-     * @param old_value The old value that was loaded during processing of slots.
-     * @return The value loaded before => old_value: success, 0: empty, otherwise: fail.
-     */
-    [[nodiscard]] uint64_t set_reserve(uint64_t old_value) noexcept
+    template<uint64_t NewState>
+    [[nodiscard]] bool is_comitted(uint63_t state, uint64_t hash) noexcept
     {
-        tt_axiom(old_value == 0 or (old_value & 0b010));
-        auto expected = old_value;
-        if (_hash.compare_exchange_strong(expected, 1)) {
-            return old_value;
-        } else {
-            return expected;
-        }
+        static_assert(State >= 0b100 and State <= 0b111);
+
+        hash <<= 3;
+        hash |= State;
+        return hash == state;
     }
 
-    /** Commit the slot as read-only
+    /** Commit the slot from the `set()` function.
      *
      * @note It is undefined behavior if the slot is not reserved.
-     * @param hash The hash value to use, must end in 0b100.
+     * @tparam NewState state to use.
+     * @param hash The hash value to use.
      */
-    void set_commit_read_only(uint64_t hash) noexcept
+    template<uint64_t NewState>
+    void commit(uint64_t hash) noexcept
     {
-        tt_axiom(hash & 7 == 0b00);
-        tt_axion(_hash.load(std::memory_order_relaxed) == 1);
-        _hash.store(hash | 1, std::memory_order_release); 
+        static_assert(State >= 0b100 and State <= 0b111);
+
+        hash <<= 3;
+        hash |= NewState;
+        _hash.store(hash, std::memory_order_release); 
     }
 
-    /** Commit the slot as read-only
-     *
-     * @note It is undefined behavior if the slot is not comitted as read-only.
-     * @param hash The hash value to use, must end in 0b100.
-     */
-    void set_commit(uint64_t hash) noexcept
-    {
-        tt_axiom(hash & 7 == 0b00);
-        tt_axion(_hash.load(std::memory_order_relaxed) == (hash | 1));
-        _hash.store(hash | 1, std::memory_order_relaxed); 
-    }
-    
-    /** Destroy the item.
-     *
-     * @pre All slot's of the table must be empty, reseved or entombed.
-     * @pre The use count of the slot's table must be zero.
+    /** Destroy the key/value in the slot.
      */
     void destroy() noexcept
     {
@@ -298,20 +200,27 @@ class wfree_hash_map_slot {
      * @pre `reserve()` must be called before this function.
      * @param key The key to store.
      * @param value The value to store.
-     * @param hash The hash value of the key must be larger than 2.
      */
     template<forward_for<key_type> Key, forward_for<value_type> Value>
-    void emplace(Key &&key, Value &&value, size_t hash) noexcept
+    void emplace(Key &&key, Value &&value) noexcept
     {
-        tt_axiom(hash > 2);
-        tt_axiom(_hash.load(std::memory_order::relaxed) == 1);
-
         std::construct_at(item_ptr(), std::forward<Key>(key), std::forward<Value>(value));
-        _hash.store(hash, std::memory_order::release);
     }
 
 private:
-    std::atomic<uint64_t> _state;
+    /** The state of the slot.
+     *
+     * Values:
+     *  -               0: empty
+     *  -               1: reserved
+     *  - <generation>010: Tombstone with the generation when it was created.
+     *  -             011: -- NEVER USE --
+     *  -       <hash>100: Prepare for `set()`.
+     *  -       <hash>101: Prepare for `move()`.
+     *  -       <hash>110:           
+     *  -       <hash>111: Comitted.
+     */
+    std::atomic<state_type> _state;
     alignas(item_type) std::array<char, sizeof(item_type)> _buffer;
 };
 
