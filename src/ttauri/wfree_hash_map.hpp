@@ -40,7 +40,23 @@ struct wfree_hash_map_slot {
     using value_type = V;
     using item_type = wfree_hash_map_item<key_type, value_type>;
 
-    using enum commit_type { move = 0, normal = 1, set = 2 };
+    using enum commit_type {
+        /** Key/value created by moving.
+         */
+        move = 0,
+
+        /** Key/value created by moving, locked.
+         */
+        move_locked = 1,
+
+        /** Key/value created by set.
+         */
+        set = 2,
+
+        /** Key/value created by set, locked.
+         */
+        set_locked = 3
+    };
 
     /** The state of the slot.
      *
@@ -49,10 +65,10 @@ struct wfree_hash_map_slot {
      *  -               1: reserved
      *  - <generation>010: Tombstone with the generation when it was created.
      *  -             011: -- NEVER USE --
-     *  -       <hash>100: `move()`-commit.
-     *  -       <hash>101: normal-commit.
-     *  -       <hash>110: `set()`-commit.
-     *  -       <hash>111:
+     *  -       <hash>100: fragile - Last found by get(), duplicates removed by get().
+     *  -       <hash>101: weak - Last found by get(), can't delete
+     *  -       <hash>110: medium - First found by get()
+     *  -       <hash>111: strong - First found by get(), can't delete.
      */
     std::atomic<state_type> _state;
     alignas(item_type) std::array<char, sizeof(item_type)> _buffer;
@@ -222,33 +238,36 @@ struct wfree_hash_map_table {
     using key_equal = KeyEqual;
     using commit_type = slot_type::commit_type;
 
-    constexpr size_t data_offset = tt::ceil(sizeof(wfree_hash_map_header), sizeof(slot_type));
-    constexpr size_t slot_offset = data_offset / sizeof(slot_type);
+    constexpr size_t header_size = sizeof(slot_type *) * 2 + sizeof(size_t) * 4;
+    constexpr size_t data_offset = tt::ceil(header_size, sizeof(slot_type));
 
-    slot_type const *_end;
+    slot_type * const begin;
+    slot_type * const end;
     size_t const capacity;
 
     std::atomic<size_t> num_reservations;
     std::atomic<size_t> num_tombstones;
-    std::atomic<size_t> clean_index;
+    std::atomic<size_t> cleanup_index;
 
     wfree_hash_map_table(wfree_hash_map_table const &) = delete;
     wfree_hash_map_table(wfree_hash_map_table &&) = delete;
     wfree_hash_map_table &operator=(wfree_hash_map_table const &) = delete;
     wfree_hash_map_table &operator=(wfree_hash_map_table &&) = delete;
-    wfree_hash_map_table(size_t capacity) noexcept :
-        capacity(capacity), num_reservations(0), num_tombstones(0), clean_index(capacity + 1), use_count(0)
-    {
-    }
 
     ~wfree_hash_map_table() noexcept
     {
         std::destroy(begin(), end());
     }
 
-    wfree_hash_map_table(size_t capacity) noexcept : wfree_hash_map_header(capacity), _end(begin() + capacity)
+    wfree_hash_map_table(size_t capacity) noexcept :
+        begin(reinterpret_cast<slot_type *>(reinterpret_cast<char *>(this) + data_offset)),
+        end(begin + capacity),
+        capacity(capacity),
+        num_reservations(0),
+        num_tombstones(0),
+        clean_index(0)
     {
-        for (auto it = begin(); it != end(); ++it) {
+        for (auto it = begin; it != end; ++it) {
             std::construct_at(it);
         }
     }
@@ -273,41 +292,31 @@ struct wfree_hash_map_table {
         num_tombstones.fetch_sub(1, std::memory_order::relaxed);
     }
 
-    void size_t hash_to_index(uint64_t hash) noexcept
+    void size_t hash_to_index(uint64_t hash) const noexcept
     {
         // Top three bits must be zero.
         tt_axiom((hash >> 61) == 0);
         return static_cast<size_t>(index % capacity);
     }
 
-    slot_type *begin() noexcept
+    [[nodiscard]] slot_type *increment_slot(slot_type *it) const noexcept
     {
-        return reinterpret_cast<slot_type *>(this) + slot_offset;
+        return ++it == end ? begin : it;
     }
 
-    slot_type *end() noexcept
+    [[nodiscard]] slot_type *decrement_slot(slot_type *it) const noexcept
     {
-        return _end;
+        return it-- == begin ? end - 1 : it;
     }
 
-    [[nodiscard]] slot_type *increment_slot(slot_type *it) noexcept
+    [[nodiscard]] slot_type *first_slot(size_t hash) const noexcept
     {
-        return ++it == end() ? begin() : it;
+        return begin + hash_to_index(hash);
     }
 
-    [[nodiscard]] slot_type *decrement_slot(slot_type *it) noexcept
+    [[nodiscard]] slot_type *last_slot(slot_type *it) const noexcept
     {
-        return it-- == begin() ? end() - 1 : it;
-    }
-
-    [[nodiscard]] slot_type *first_slot(size_t hash) noexcept
-    {
-        return begin() + hash_to_index(hash);
-    }
-
-    [[nodiscard]] slot_type *last_slot(slot_type *it) noexcept
-    {
-        while (it->hash()) {
+        while (it->state()) {
             it = increment_slot(it);
         }
         return it;
@@ -319,124 +328,77 @@ struct wfree_hash_map_table {
      * @param hash The hash of the key.
      * @return The slot that matches the key, or nullptr
      */
-    slot_type *get(key_type const &key, uint64_t hash, uint64_t generation) noexcept
+    slot_type *get(key_type const &key, uint64_t hash, uint64_t generation) const noexcept
     {
         ttlet commit_state = (hash << 3) | 0b100;
 
         slot_type *it = first_slot(hash);
-        slot_type *move_match = nullptr;
-        uint64_t move_state = 0;
+        slot_type *move_match = nullptr; // return value if not found.
         while (ttlet state = it->state()) {
             if (ttlet match = state ^ commit_state; match <= 3 and key_equal{}(it->key, key)) {
-                if (move_match) {
-                    if (move_match->tombstone(move_state, generation)) {
-                        increment_tombstones();
-                    }
-                }
-
-                if (match) {
-                    // Found commit or `set()`-commit.
+                if (match & 0b10) {
+                    // Found set-key/value (locked/unlocked).
                     return it;
 
                 } else {
-                    // Found `move()`-commit.
+                    // Found move-key/value (locked/unlocked).
                     move_match = it;
-                    move_state = state;
                 }
             }
 
             it = increment_slot(it);
         }
+
         return move_match;
     }
 
     /** Remove a key from the table.
      *
-     * @param first The first slot matching the key.
-     * @param last One beyond the last slot matching the key.
+     * @tparam RemoveLocked Also remove matching slots that are locked.
      * @param key The key to remove from the table.
-     * @param hash The hash of the key lower bits must '100'.
-     * @param generation The current generation. lower bits must be '010'.
+     * @param hash The hash of the key.
+     * @param generation The current generation.
      * @return The previous matching slot.
      */
-    slot_type *remove(slot_type *first, slot_type *last, key_type const &key, uint64_t hash, uint64_t generation) noexcept
+    template<bool RemoveLocked>
+    slot_type *remove(key_type const &key, uint64_t hash, uint64_t generation) noexcept
     {
         ttlet commit_state = (hash << 3) | 0b100;
-        ttlet old_generation = generation - 3;
 
-        auto it = last;
-        auto lowest_slot = last;
+        slot_type *it = first_slot(hash);
         slot_type *found = nullptr;
-        do {
-            it = decrement_slot(it);
-            ttlet state = it->state();
 
-            if (slot_type::is_old_tombstone(state, old_generation) and it < lowest_slot and it->clear<True>(state)) {
-                // Found a tombstone of more than 3 generations old.
-                //
-                // This works because `set` iterates forward and uses 2nd generation slots and on contention:
-                // - When `set()` wins it will use the slot.
-                // - When `set()` looses it will see an empty slot that it will now use.
-                // - In either case there will be no other 3rd generation slots left for this thread to reclaim.
-                //
-                // If there is no contention with `set` it can reclaim multiple 3rd generation slots.
-                decrement_tombstones();
-                decrement_reservations();
-
-            } else if (ttlet match = state ^ commit_state; match <= 1 and key_equal{}(it->key, key)) {
-                // Found a matching `move()`-commit or normal-commit. IGNORE `set()`-commit.
-                if (match) {
-                    // Found a normal-commit.
-                    // Report the first normal commit in a chain.
-                    found == it;
-                    if (it->set_tombstone(h, generation)) {
-                        increment_tombstones();
-                    }
-                } else {
-                    // Found a `move()`-commit.
-                    // Only report the last `move()` commit in a chain, if no other commits are available.
-                    if (not found) {
-                        found = it;
-                    }
-                    if (it->set_tombstone(h, generation)) {
-                        increment_tombstones();
-                    }
+        if (uint64_t state = it->state()) {
+            // Look forward remove all move-key/values.
+            do {
+                if (ttlet match = state ^ commit_state; (match == 0 or (RemoveLocked and match == 1)) and key_equal{}(it->key, key)) {
+                    found = it;
+                    increment_tombstones();
+                    it->tombstone(state, generation);
                 }
 
-            } else if (state & 0b100) {
-                // Found a used slot, check where its location was supposed to be.
-                inplace_min(lowest_slot, first_slot(state >> 3));
-            }
-        } while (it != first);
+                it = increment_slot(it);
+            } while (state = it->state());
+
+            it = decrement_slot(it);
+
+            // Look backward remove all set-key/values.
+            do {
+                if (ttlet match = state ^ commit_state; (match == 2 or (RemovedLocked and match == 3)) and key_equal{}(it->key, key)) {
+                    found = found ? found : it;
+                    increment_tombstones();
+                    it->tombstone(state, generation);
+                }
+
+                it = decrement_slot(it);
+            } while (state = it->state());
+        }
 
         return found;
     }
 
-    /** Remove a key from the table.
-     *
-     * @param key The key to remove from the table.
-     * @param hash The hash of the key lower bits must '100'.
-     * @param generation The current generation. lower bits must be '010'.
-     * @return The previous matching slot.
-     */
-    slot_type *remove(key_type const &key, uint64_t hash, uint64_t generation) noexcept
-    {
-        auto first = first_slot(hash);
-        auto last = last_slot(first);
-        return remove(first, last, key, hash, generation);
-    }
-
-    /** Set a new key value in the table, overwriting existing.
-     *
-     * @tparam Try If true then set will not insert the key if it already exists.
-     * @tparam Move If true then set will insert a moved key/value.
-     * @param key The key to add to the table.
-     * @param value The value to add to the table.
-     * @param hash The hash of the key.
-     * @return The previous matching slot.
-     */
-    template<forward_for<value_type> Value, bool Try, bool Move>
-    slot_type *set(key_type const &key, Value &&value, uint64_t hash, uint64_t generation) noexcept
+    template<bool Force>
+    slot_type *reserve(key_type const &key, uint64_t hash, uint64_t generation) noexcept
     {
         ttlet commit_state = (hash << 3) | 0b100;
         ttlet old_generation = generation - 2;
@@ -447,78 +409,186 @@ struct wfree_hash_map_table {
             ttlet state = it->state();
 
             if (slot_type::is_old_tombstone(state, old_generation)) {
-                ttlet new_state = it->reserve(state);
-
-                // Due to race with `remove()` the tombstone may have be reclaimed and the slot has become empty.
-                if (new_state == 1 or (new_state == 0 and it->reserve(new_state) == 1)) {
+                if (ttlet new_state = it->reserve(state); new_state == 1) {
                     // Successfully Reserved.
+                    decrement_tombstone();
                     increment_reservations();
-                    break;
+                    return it;
+
+                } else if (new_state == 0 and it->reserve(new_state) {
+                    // Race with `reclaim()` which made this slot empty, but now successfully Reserved.
+                    increment_reservations();
+                    return it;
                 }
 
-            } else if (Try and (state ^ commit_state) <= 3 and key_equal{}(it->key, key)) {
-                // Found match, don't set the value.
-                return it;
+            } else if (not Force and (state ^ commit_state) <= 3 and key_equal{}(it->key, key)) {
+                // Found a previous match.
+                return nullptr;
 
             } else if (state == 0 and it->reserve(state) == 1) {
                 // Successfully reserved.
                 increment_reservations();
-                break;
+                return it;
             }
 
             it = increment_slot(it);
         }
+        tt_unreachable();
+    }
 
-        // Start using the reserved slot. Commit as read-only so that it won't get removed.
-        it->emplace(key, std::forward<Value>(value));
+    /** Set a new key value in the table, overwriting existing.
+     *
+     * @tparam Force If true force the new key/value to be set even if it already existed
+     * @param key The key to add to the table.
+     * @param value The value to add to the table.
+     * @param hash The hash of the key.
+     * @return The previous matching slot.
+     */
+    template<forward_for<value_type> Value, bool Force>
+    bool set(key_type const &key, Value &&value, uint64_t hash, uint64_t generation) noexcept
+    {
+        if (ttlet it = reserve<Force>(key, hash, generation)) {
+            it->emplace(key, std::forward<Value>(value));
 
-        if constexpr (Move) {
-            // `move()`-commit; A very fragile insertion, may be deleted when duplicates are found.
-            it->commit<commit_type::move>(hash);
-            return it;
+            // set_locked; can not be deleted by `remove<false>`, but it can be found with `get()`.
+            it->commit<commit_type::set_locked>(hash);
+
+            // Remove previous matching slots.
+            remove<false>(key, hash, generation);
+
+            // normal-commit, it may race with remove(), so check if it is still locked.
+            it->commit<commit_type::set>(hash, (hash << 3) | 0b111);
+            return true;
 
         } else {
-            // `set()`-commit; can not be deleted by `remove()`, but it can be found with `get()`.
-            it->commit<commit_type::set>(hash);
-
-            // Go all the way to the end, then execute a remove to remove duplicates.
-            ttlet last = last_slot(it);
-            ttlet match = remove(first, last, key, hash, generation);
-
-            // normal-commit, it may now be deleted.
-            it->commit<commit_type::normal>(hash);
-
-            return Try ? nullptr : match;
+            return false;
         }
     }
 
     /** Move an entry from another hash map table.
      *
      * @post The key/value may be added to this table and is removed from the other table.
-     * @param other_table A pointer to the other table.
-     * @param other_slot A slot from the other table to move.
+     * @param key The key to add to the table.
+     * @param value The value to add to the table.
      * @param hash The hash value of the key in the other_slot.
+     * @param other_table A pointer to the other table.
      * @return The slot used in the new table.
      */
-    slot_type *move_from(wfree_hash_map_table *other_table, slot_type *other_slot, uint64_t hash, uint64_t generation) noexcept
+    slot_type *move_from(key_type const &key, value_type const &value, uint64_t hash, uint64_t generation, wfree_hash_map_tabe *other_table) noexcept
     {
-        tt_axiom(other_table != nullptr);
-        tt_axiom(other_slot != nullptr);
-
         // Copy the key and value from the other slot.
-        slot_type *new_slot = set<true, true>(other_slot->key, other_slot->value, hash, generation);
+        ttlet it = reserve<false>(key, hash, generation);
+        tt_axiom(it != nullptr);
+        it->emplace(key, value);
 
-        // Tombstone the other slot, if it is still in committed state.
-        ttlet state = other_slot->state();
-        ttlet commit_state = (hash >> 3) ^ 0b100;
-        if ((state ^ commit_state) <= 3) {
-            if (other_slot->tombstone(state, generation)) {
-                other_table->increment_tombstone();
-            }
-        }
+        // Since this entry came from the secondary table, any race on the primary table should win from this entry.
+        // This commit is fragile and will be the first deleted on cleanup.
+        it->commit<commit_type::move>(hash);
 
+        // Tombstone all the entries that match from the old table.
+        tt_axiom(other_table != nullptr);
+        other_table->remove<true>(key, hash, generation);
+
+        // Cleanup duplicates that appeared during racing.
+        cleanup(other_slot->key, hash, generation);
         return new_slot;
     }
+
+
+    slot_type *cleanup_duplicates(key_type const &key, uint64_t hash, uint64_t generation, slot_type *it) noexcept
+    {
+        ttlet commit_state = (hash << 3) | 0b100;
+
+        slot_type *move_match = nullptr;
+        uint64_t move_state = 1; // locked.
+        slot_type *set_match = nullptr;
+        uint64_t set_state = 1; // locked.
+        while (ttlet state = it->state()) {
+            if (ttlet match = state ^ commit_state; match <= 3 and key_equal{}(it->key, key)) {
+                // Remove unlocked move-key/value.
+                if ((move_state & 1) == 0 and move_match->tombstone(move_state, generation)) {
+                    increment_tombstones();
+                    move_state = 1;
+                }
+
+                if (set_match)
+                    // After set is found remove all unlocked-key/value behind it.
+                    if ((match & 1 == 0) and it->tombstone(state, generation)) {{
+                        increment_tombstones();
+                    }
+
+                } else if (match & 0b10) {
+                    // Found set-key/value (locked/unlocked).
+                    set_match = it;
+                    set_state = state;
+
+                } else {
+                    // Found move-key/value (locked/unlocked).
+                    move_match = it;
+                    move_state = state;
+                }
+            }
+
+            it = increment_slot(it);
+        }
+
+        bool found_set = set_match != nullptr;
+        set_match = found_set ? set_match : move_match;
+        set_state = found_set ? set_state : move_state;
+        return {set_match, set_state};
+    }
+
+    /** Cleanup of slots.
+     *
+     * Search forward:
+     * - Delete (non-locked) move-duplicates
+     * - Delete (non-locked) set-duplicates
+     * - Move-locked the final matching entry to the perfect slot if available.
+     * - Delete final matching entry.
+     * - Recommit to normal move.
+     *
+     * Search backward.
+     * - Find old tombstones and make empty, if items's perfect locations are after it.
+     *
+     * @post The key/value may be added to this table and is removed from the other table.
+     * @param key The key to add to the table.
+     * @param value The value to add to the table.
+     * @param hash The hash value of the key in the other_slot.
+     * @param other_table A pointer to the other table.
+     * @return The slot used in the new table.
+     */
+    void cleanup(key_type const &key, uint64_t hash, uint64_t generation) noexcept
+    {
+        ttlet commit_state = (hash << 3) | 0b100;
+
+        ttlet first = first_slot(hash);
+        ttlet [found, found_state] = cleanup_duplicates(key, hash, generation, first);
+
+        if (found) {
+            ttlet state = first->state();
+            ttlet old_generation = generation + 4;
+            if (slot_type::is_old_tombstones(state, old_generation) and first->reserve(state) == 1) {
+                increment_reserved();
+                decrement_tombstones();
+                first->emplace(found->key, found->value, hash);
+                first->commit<commit_type::move_locked>(hash);
+
+                // Delete the previous version
+                if (found->tombstone(found_state, generation)) {
+                    increment_tombstones();
+                    // It may race with remove() so check if it is still move_locked.
+                    first->commit<commit_type::move>(hash, (hash << 3) | 0b101);
+                } else {
+                    // Raced against remove() won on found.
+                    if (first->tombstone((hash << 3) | 0b101, generation)) {
+                        increment_tombstones();
+                    }
+                }
+
+            }
+        }
+    }
+
 
     /** Get the amount of bytes needed to allocate the table for a capacity.
      */
@@ -562,7 +632,26 @@ struct wfree_hash_map_table {
         std::allocator_traits<Allocator>::deallocate(
             allocator, reinterpret_cast<char *>(table_ptr), capacity_to_num_bytes(capacity));
     }
+
+    void clean_up_duplicates(size_t index, uint64_t generation) noexcept
+    {
+        auto *slote = begin() + index;
+        auto state = the_slot->state();
+
+        if (state & 0b100) {
+            get<true>(the_slot->key(), state >> 3, generation);
+        }
+    }
+
+    bool clean_up(uint64_t generation) noexcept
+    {
+        auto index = _clean_up_inde.add_fetch(1, std::memory_order::relaxed);
+        index %= capacity;
+
+        clean_up_duplicates(static_cast<size_t>(index));
+    }
 };
+static_assert(wfree_hash_map_table::header_size == sizeof(wfree_hash_map_table));
 
 class wfree_hash_map_base {
 public:
